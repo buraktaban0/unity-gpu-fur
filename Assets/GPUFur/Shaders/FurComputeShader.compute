@@ -1,0 +1,185 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel SimulateGPUFur
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+
+struct FurVertexData
+{
+	float3 direction;
+	float3 position;
+	float3 velocity;
+	float3 acceleration;
+	float3 rootForce;
+	float3 color;
+};
+
+
+RWStructuredBuffer<FurVertexData> buffer;
+
+
+float fixedDeltaTime;
+float dt;
+float segmentLength;
+float stiffness;
+float springConstant;
+Texture3D noiseTexture;
+float3 noiseDimensions;
+float3 noise3DScale;
+float3 noiseOffset;
+float innerFriction;
+float airFriction;
+float3 gravity;
+float3 position;
+float3 positionDelta;
+float3 rotationDelta;
+
+int iterations;
+
+float irregularWind;
+float windStrength;
+float3 windForward, windRight, windUp;
+
+int vertexCount;
+
+float3 nudge = float3(0.001, 0.001, 0.001);
+
+
+float sqrMag(float3 v)
+{
+	return v.x*v.x + v.y*v.y + v.z*v.z;
+}
+
+[numthreads(16, 1, 1)]
+void SimulateGPUFur(uint3 id : SV_DispatchThreadID)
+{
+	uint iID = id.x;
+	uint start = iID * vertexCount;
+	uint end = iID * vertexCount + vertexCount;
+
+	FurVertexData vPre, v, vNext;
+
+
+	// DELTA ROTATION
+	v = buffer[start];
+
+	buffer[start] = v;
+
+	float totalDT = 0.0;
+	float idt = fixedDeltaTime;
+	float3 force, wind;
+	float3 stiffnessForce;
+	float mag;
+	float3 posDeltaIter = positionDelta / iterations;
+	float3 rot = rotationDelta / iterations;
+	float sina = sin(rot.x);
+	float cosa = cos(rot.x);
+	float sinb = sin(rot.y);
+	float cosb = cos(rot.y);
+	float sinc = sin(rot.z);
+	float cosc = cos(rot.z);
+	float x, y, z;
+	while (totalDT < dt)
+	{
+		totalDT += idt;
+
+		vPre = buffer[start];
+
+		vPre.position += posDeltaIter;
+		float3 pos = vPre.position - position;
+		x = pos.x; y = pos.y; z = pos.z;
+		pos = float3(x*cosc - y * sinc, x*sinc + y * cosc, z);
+		x = pos.x; y = pos.y; z = pos.z;
+		pos = float3(x*cosb + z * sinb, y, -x * sinb + z * cosb);
+		x = pos.x; y = pos.y; z = pos.z;
+		pos = float3(x, y*cosa - z * sina, y*sina + z * cosa);
+		vPre.position = pos + position;
+
+		pos = vPre.direction;
+		x = pos.x; y = pos.y; z = pos.z;
+		pos = float3(x*cosc - y * sinc, x*sinc + y * cosc, z);
+		x = pos.x; y = pos.y; z = pos.z;
+		pos = float3(x*cosb + z * sinb, y, -x * sinb + z * cosb);
+		x = pos.x; y = pos.y; z = pos.z;
+		pos = float3(x, y*cosa - z * sina, y*sina + z * cosa);
+		vPre.direction = pos;
+
+		buffer[start] = vPre;
+
+		int i = start;
+		for (; i < end - 1; i += 1)
+		{
+			vPre = buffer[i];
+			v = buffer[i + 1];
+			v.direction = normalize(v.position - vPre.position);
+			force = vPre.position - v.position;
+			mag = length(force);
+			if (mag > 0.0)
+			{
+				force = -force / mag * (mag - segmentLength) * springConstant;
+			}
+			else
+			{
+				force *= 0.0;
+			}
+			force += -(vPre.velocity - v.velocity) * innerFriction;
+			vPre.acceleration += force;
+			v.acceleration -= force;
+
+
+			/* wind */
+			wind = v.position * noise3DScale + noiseOffset;
+			wind = (noiseTexture[uint3((uint)wind.x%noiseDimensions.x, (uint)wind.y%noiseDimensions.y, (uint)wind.z%noiseDimensions.z)].xyz - 0.46) * windStrength;
+
+			float wf = abs(dot(windForward, wind));
+			float wr = (dot(windRight, wind)) * irregularWind;
+			float wu = (dot(windUp, wind)) * irregularWind;
+
+			wind = windForward * wf + windRight * wr + windUp * wu;
+
+			v.acceleration += gravity + nudge + wind - v.velocity * airFriction;
+
+			buffer[i] = vPre;
+			buffer[i + 1] = v;
+		}
+
+		/* stiffness */
+		vPre = buffer[start];
+		v = buffer[start + 1];
+		v.acceleration += (vPre.position + vPre.direction * segmentLength - v.position) * stiffness / 2;
+		buffer[start + 1] = v;
+
+		i = start;
+		for (; i < end - 2; i += 1)
+		{
+			vPre = buffer[i];
+			v = buffer[i + 1];
+			vNext = buffer[i + 2];
+			stiffnessForce = ((vPre.position + vNext.position) * 0.5 - v.position) * stiffness;
+			v.acceleration += stiffnessForce;
+			vPre.acceleration -= stiffnessForce * 0.5;
+			vNext.acceleration -= stiffnessForce * 0.5;
+			buffer[i] = vPre;
+			buffer[i + 1] = v;
+			buffer[i + 2] = vNext;
+		}
+
+		/*vPre = buffer[start];
+		vPre.acceleration *= 0.0;
+		vPre.velocity *= 0.0;
+		buffer[start] = vPre;*/
+
+		for (i = start + 1; i < end; i += 1)
+		{
+			v = buffer[i];
+			v.velocity += v.acceleration * idt;
+			v.position += v.velocity * idt;
+			v.acceleration = 0;
+			buffer[i] = v;
+		}
+	}
+
+}
+
+
+
